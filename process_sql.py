@@ -148,11 +148,76 @@ def tokenize(string):
 
 
 def scan_alias(toks):
-    """Scan the index of 'as' and build the map for all alias"""
-    as_idxs = [idx for idx, tok in enumerate(toks) if tok == 'as']
+    """Scan and build the map for table aliases (both explicit with AS and implicit without AS)"""
     alias = {}
-    for idx in as_idxs:
-        alias[toks[idx+1]] = toks[idx-1]
+    len_ = len(toks)
+    in_from_clause = False
+    i = 0
+    
+    while i < len_:
+        tok = toks[i]
+        
+        # Track when we enter FROM clause
+        if tok == 'from':
+            in_from_clause = True
+            i += 1
+            continue
+        
+        # JOIN keyword means we're back to looking for table names
+        if tok == 'join':
+            in_from_clause = True
+            i += 1
+            continue
+        
+        # Exit FROM clause when we hit WHERE, GROUP, ORDER, HAVING, LIMIT, set operators, closing paren, or semicolon
+        if tok in ('where', 'group', 'order', 'having', 'limit', 'intersect', 'union', 'except', ')', ';'):
+            in_from_clause = False
+            i += 1
+            continue
+        
+        # In FROM clause, look for table aliases
+        if in_from_clause:
+            # Skip 'on' keyword - it starts a condition but we stay in FROM clause context
+            # because there might be more JOINs after the ON condition
+            if tok == 'on':
+                i += 1
+                continue
+            
+            # Skip commas
+            if tok == ',':
+                i += 1
+                continue
+            
+            # Skip opening parenthesis (subquery)
+            if tok == '(':
+                i += 1
+                continue
+            
+            # Check for explicit alias with AS keyword
+            if i + 2 < len_ and toks[i + 1] == 'as':
+                table_name = toks[i]
+                alias_name = toks[i + 2]
+                alias[alias_name] = table_name
+                i += 3
+                continue
+            
+            # Check for implicit alias (table followed by identifier that's not a keyword)
+            if i + 1 < len_:
+                next_tok = toks[i + 1]
+                # If next token is not a keyword or special character, it's likely an alias
+                if (next_tok not in CLAUSE_KEYWORDS and 
+                    next_tok not in JOIN_KEYWORDS and 
+                    next_tok not in ('(', ')', ',', ';', 'on') and
+                    next_tok not in COND_OPS and
+                    next_tok not in WHERE_OPS):
+                    table_name = toks[i]
+                    alias_name = toks[i + 1]
+                    alias[alias_name] = table_name
+                    i += 2
+                    continue
+        
+        i += 1
+    
     return alias
 
 
@@ -260,9 +325,12 @@ def parse_table_unit(toks, start_idx, tables_with_alias, schema):
     key = tables_with_alias[toks[idx]]
 
     if idx + 1 < len_ and toks[idx+1] == "as":
-        idx += 3
+        idx += 3  # skip table, 'as', and alias
+    elif idx + 1 < len_ and toks[idx+1] not in CLAUSE_KEYWORDS and toks[idx+1] not in JOIN_KEYWORDS and toks[idx+1] not in (')', ',', 'on'):
+        # Handle implicit alias: FROM table alias (without AS keyword)
+        idx += 2  # skip table and alias
     else:
-        idx += 1
+        idx += 1  # just skip table name
 
     return idx, schema.idMap[key], key
 
@@ -357,6 +425,11 @@ def parse_select(toks, start_idx, tables_with_alias, schema, default_tables=None
             idx += 1
         idx, val_unit = parse_val_unit(toks, idx, tables_with_alias, schema, default_tables)
         val_units.append((agg_id, val_unit))
+        
+        # Skip column alias if present (e.g., "AS alias_name" or just "alias_name")
+        if idx < len_ and toks[idx] == 'as':
+            idx += 2  # skip 'as' and the alias name
+        
         if idx < len_ and toks[idx] == ',':
             idx += 1  # skip ','
 

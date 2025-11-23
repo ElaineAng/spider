@@ -25,6 +25,7 @@ import json
 import sqlite3
 import traceback
 import argparse
+import nltk
 
 from process_sql import tokenize, get_schema, get_tables_with_alias, Schema, get_sql
 
@@ -55,6 +56,7 @@ HARDNESS = {
     "component2": ('except', 'union', 'intersect')
 }
 
+nltk.download('punkt_tab')
 
 def condition_has_or(conds):
     return 'or' in conds[1::2]
@@ -511,7 +513,7 @@ def evaluate(gold, predict, db_dir, etype, kmaps):
 
         try:
             p_sql = get_sql(schema, p_str)
-        except:
+        except Exception as e:
             # If p_sql is not valid, then we will use an empty sql to evaluate with the correct sql
             p_sql = {
             "except": None,
@@ -533,6 +535,7 @@ def evaluate(gold, predict, db_dir, etype, kmaps):
             }
             eval_err_num += 1
             print("eval_err_num:{}".format(eval_err_num))
+            print(e)
 
         # rebuild sql for value evaluation
         kmap = kmaps[db_name]
