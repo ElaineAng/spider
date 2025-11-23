@@ -29,7 +29,7 @@ import sqlite3
 from nltk import word_tokenize
 
 CLAUSE_KEYWORDS = ('select', 'from', 'where', 'group', 'order', 'limit', 'intersect', 'union', 'except')
-JOIN_KEYWORDS = ('join', 'on', 'as')
+JOIN_KEYWORDS = ('join', 'on', 'as', 'left', 'right', 'inner', 'outer', 'cross', 'full')
 
 WHERE_OPS = ('not', 'between', '=', '>', '<', '>=', '<=', '!=', 'in', 'like', 'is', 'exists')
 UNIT_OPS = ('none', '-', '+', "*", '/')
@@ -152,6 +152,7 @@ def scan_alias(toks):
     alias = {}
     len_ = len(toks)
     in_from_clause = False
+    paren_depth = 0  # Track parenthesis depth to handle subqueries
     i = 0
     
     while i < len_:
@@ -160,6 +161,14 @@ def scan_alias(toks):
         # Track when we enter FROM clause
         if tok == 'from':
             in_from_clause = True
+            paren_depth = 0  # Reset depth when entering FROM
+            i += 1
+            continue
+        
+        # JOIN keyword (with optional modifiers like LEFT, RIGHT, INNER, OUTER)
+        # Skip join modifiers (LEFT, RIGHT, INNER, OUTER, CROSS, FULL)
+        if tok in ('left', 'right', 'inner', 'outer', 'cross', 'full'):
+            # These are join modifiers, just skip them
             i += 1
             continue
         
@@ -169,14 +178,36 @@ def scan_alias(toks):
             i += 1
             continue
         
-        # Exit FROM clause when we hit WHERE, GROUP, ORDER, HAVING, LIMIT, set operators, closing paren, or semicolon
-        if tok in ('where', 'group', 'order', 'having', 'limit', 'intersect', 'union', 'except', ')', ';'):
+        # Track parenthesis depth
+        if tok == '(':
+            paren_depth += 1
+        elif tok == ')':
+            paren_depth -= 1
+        
+        # Exit FROM clause when we hit WHERE, GROUP, ORDER, etc.
+        # But only exit on ')' if we're at depth < 0 (closing the FROM clause itself)
+        if tok in ('where', 'group', 'order', 'having', 'limit', 'intersect', 'union', 'except', ';'):
             in_from_clause = False
             i += 1
             continue
         
-        # In FROM clause, look for table aliases
+        if tok == ')' and paren_depth < 0:
+            in_from_clause = False
+            i += 1
+            continue
+        
+        # In FROM clause, look for table aliases and subquery aliases
         if in_from_clause:
+            # Check for subquery alias pattern: ) AS alias
+            # This should be at paren_depth 0 (we just closed a subquery at depth 1, now at 0)
+            if tok == ')' and paren_depth == 0 and i + 2 < len_ and toks[i + 1] == 'as':
+                # This is a closing paren for a subquery, followed by AS alias
+                alias_name = toks[i + 2]
+                # Use a special marker for subquery aliases - they don't map to a real table
+                alias[alias_name] = "__subquery__"
+                i += 3  # skip ), AS, and alias
+                continue
+            
             # Skip 'on' keyword - it starts a condition but we stay in FROM clause context
             # because there might be more JOINs after the ON condition
             if tok == 'on':
@@ -192,7 +223,7 @@ def scan_alias(toks):
             if tok == '(':
                 i += 1
                 continue
-            
+           
             # Check for explicit alias with AS keyword
             if i + 2 < len_ and toks[i + 1] == 'as':
                 table_name = toks[i]
@@ -205,7 +236,9 @@ def scan_alias(toks):
             if i + 1 < len_:
                 next_tok = toks[i + 1]
                 # If next token is not a keyword or special character, it's likely an alias
-                if (next_tok not in CLAUSE_KEYWORDS and 
+                # Also check that current token is not itself a special keyword
+                if (tok not in ('not', 'exists', 'select') and
+                    next_tok not in CLAUSE_KEYWORDS and 
                     next_tok not in JOIN_KEYWORDS and 
                     next_tok not in ('(', ')', ',', ';', 'on') and
                     next_tok not in COND_OPS and
@@ -239,13 +272,26 @@ def parse_col(toks, start_idx, tables_with_alias, schema, default_tables=None):
 
     if '.' in tok:  # if token is a composite
         alias, col = tok.split('.')
-        key = tables_with_alias[alias] + "." + col
+        table = tables_with_alias.get(alias)
+        
+        # Handle subquery aliases - they don't have real schema
+        if table == "__subquery__":
+            # For subquery results, we can't validate against schema
+            # Just create a special ID for this column
+            return start_idx+1, "__subquery__." + col + "__"
+        
+        key = table + "." + col
         return start_idx+1, schema.idMap[key]
 
     assert default_tables is not None and len(default_tables) > 0, "Default tables should not be None or empty"
 
     for alias in default_tables:
         table = tables_with_alias[alias]
+        
+        # Skip subquery aliases when looking for columns without table prefix
+        if table == "__subquery__":
+            continue
+            
         if tok in schema.schema[table]:
             key = table + "." + tok
             return start_idx+1, schema.idMap[key]
@@ -375,24 +421,46 @@ def parse_condition(toks, start_idx, tables_with_alias, schema, default_tables=N
     conds = []
 
     while idx < len_:
-        idx, val_unit = parse_val_unit(toks, idx, tables_with_alias, schema, default_tables)
         not_op = False
-        if toks[idx] == 'not':
+        
+        # Peek ahead to check if this is "NOT EXISTS" or just "EXISTS" (no left-hand value)
+        # vs "column NOT IN" (has left-hand value)
+        is_exists_pattern = False
+        if idx < len_ and toks[idx] == 'not' and idx + 1 < len_ and toks[idx + 1] == 'exists':
+            is_exists_pattern = True
             not_op = True
-            idx += 1
-
-        assert idx < len_ and toks[idx] in WHERE_OPS, "Error condition: idx: {}, tok: {}".format(idx, toks[idx])
-        op_id = WHERE_OPS.index(toks[idx])
-        idx += 1
-        val1 = val2 = None
-        if op_id == WHERE_OPS.index('between'):  # between..and... special case: dual values
-            idx, val1 = parse_value(toks, idx, tables_with_alias, schema, default_tables)
-            assert toks[idx] == 'and'
-            idx += 1
-            idx, val2 = parse_value(toks, idx, tables_with_alias, schema, default_tables)
-        else:  # normal case: single value
+            idx += 1  # skip NOT
+        elif idx < len_ and toks[idx] == 'exists':
+            is_exists_pattern = True
+        
+        if is_exists_pattern:
+            # EXISTS doesn't have a left-hand value, create a dummy val_unit
+            val_unit = (0, (0, None, False), None)  # unit_op=none, empty col_unit
+            op_id = WHERE_OPS.index('exists')
+            idx += 1  # skip EXISTS
             idx, val1 = parse_value(toks, idx, tables_with_alias, schema, default_tables)
             val2 = None
+        else:
+            # Normal case: parse left-hand value first
+            idx, val_unit = parse_val_unit(toks, idx, tables_with_alias, schema, default_tables)
+            
+            # Now check for NOT (for NOT IN, NOT LIKE, etc.)
+            if idx < len_ and toks[idx] == 'not':
+                not_op = True
+                idx += 1
+            
+            assert idx < len_ and toks[idx] in WHERE_OPS, "Error condition: idx: {}, tok: {}".format(idx, toks[idx])
+            op_id = WHERE_OPS.index(toks[idx])
+            idx += 1
+            val1 = val2 = None
+            if op_id == WHERE_OPS.index('between'):  # between..and... special case: dual values
+                idx, val1 = parse_value(toks, idx, tables_with_alias, schema, default_tables)
+                assert toks[idx] == 'and'
+                idx += 1
+                idx, val2 = parse_value(toks, idx, tables_with_alias, schema, default_tables)
+            else:  # normal case: single value
+                idx, val1 = parse_value(toks, idx, tables_with_alias, schema, default_tables)
+                val2 = None
 
         conds.append((not_op, op_id, val_unit, val1, val2))
 
@@ -458,6 +526,10 @@ def parse_from(toks, start_idx, tables_with_alias, schema):
             idx, sql = parse_sql(toks, idx, tables_with_alias, schema)
             table_units.append((TABLE_TYPE['sql'], sql))
         else:
+            # Skip join modifiers (LEFT, RIGHT, INNER, OUTER, CROSS, FULL)
+            while idx < len_ and toks[idx] in ('left', 'right', 'inner', 'outer', 'cross', 'full'):
+                idx += 1  # skip join modifier
+            
             if idx < len_ and toks[idx] == 'join':
                 idx += 1  # skip join
             idx, table_unit, table_name = parse_table_unit(toks, idx, tables_with_alias, schema)
